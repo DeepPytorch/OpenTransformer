@@ -7,4 +7,4 @@
 <p>This means that if you put this model against anoth 491B model it would finish training months later, however it would outpreform that model in nearly everything, expecialy logic and reasoning, long before the other model finished training.</p>
 <p>This model works with the looped tranformer, as I already mentioned, but this uses a standard MoE arhcitecture, just looped 30 times. To avoid having to type the code over and over again for each layer, I just used a loop to create the layers.</p>
 <p>Pls excuse my spelling errors, my dear friend spell check does not work on this.</p>
-<h3>This project was made as a birthday gift to a friend (And to test a loop transformer model), so Happy Birthday!</h3>
+<h3>This project was made as a birthday gift to a friend (And to test a loop transformer model, becuase why it only have one function), so Happy Birthday!</h3>
