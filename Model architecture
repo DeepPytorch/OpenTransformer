@@ -1,0 +1,100 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+n_e = 32
+layers = 60
+block_repeats = 60
+
+# So the effective depth in parameters 40,955,923,200*9.
+
+class MoELayer(nn.Module):
+
+    # This makes each block 30 layers, and the same weights are repeated 20 times to make a 600 layer model
+    # With only 5% of the training time.
+    # So the total # of parameters is 30 layers worth, but the effective depth is 600 layers.
+    # Also I will eventually add different modes for different number of blocks
+    # Such as a fast with uses 15 blocks, a normal with uses 30 blocks,
+    # And a thinking mode which uses 60 blocks
+
+    def __init__(self, d_model, num_experts=n_e, k=2):
+        super().__init__()
+        self.experts = nn.ModuleList([nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Linear(d_model * 4, d_model)
+        ) for _ in range(num_experts)])
+        self.router = nn.Linear(d_model, num_experts)
+        self.k = k
+
+    def forward(self, x):
+        # Route tokens to top-k experts
+        logits = self.router(x)
+        weights, indices = torch.topk(torch.softmax(logits, dim=-1), self.k, dim=-1)
+        
+        # Combine expert outputs (simplified for brevity)
+        out = torch.zeros_like(x)
+        for i in range(self.k):
+            expert_idx = indices[..., i]
+            expert_weight = weights[..., i].unsqueeze(-1)
+            # In practice, use optimized routing/scatter-gather
+            for batch in range(x.size(0)):
+                for seq in range(x.size(1)):
+                    idx = expert_idx[batch, seq]
+                    out[batch, seq] += expert_weight[batch, seq] * self.experts[idx](x[batch, seq])
+        return out
+
+# A single Transformer Layer with MoE
+class TransformerMoELayer(nn.Module):
+    def __init__(self, d_model, nhead):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+        self.moe = MoELayer(d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        # Attention + Residual
+        attn_out, _ = self.attn(x, x, x)
+        x = self.norm1(x + attn_out)
+        # MoE + Residual
+        x = self.norm2(x + self.moe(x))
+        return x
+
+# The main Loop Transformer MoE Model
+class LoopTransformerMoE(nn.Module):
+    def __init__(self, d_model, nhead, layers_per_block=layers, num_loops=block_repeats):
+        super().__init__()
+        # Define the block of 30 layers
+        self.block = nn.ModuleList([
+            TransformerMoELayer(d_model, nhead) for _ in range(layers_per_block)
+        ])
+        self.num_loops = num_loops
+
+    def forward(self, x):
+        # Repeat the block 20 times
+        for _ in range(self.num_loops):
+            for layer in self.block:
+                x = layer(x)
+        return x
+
+def count_parameters(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
+
+# Counts number of parameters in the model
+
+''' WARNING: MAY CRASH YOUR COMPUTER IF YOU TRY TO RUN IT, IT'S A VERY LARGE MODEL. ''' 
+
+#model = LoopTransformerMoE(d_model=512, nhead=8)
+#total, trainable = count_parameters(model)
+#print(f"Total Parameters: {total:,}")
+
+
+
+# Example Initialization
+# model = LoopTransformerMoE(d_model=512, nhead=8, layers_per_block=20, num_loops=10)
+
+
+print(40955923200*9)
