@@ -1,5 +1,6 @@
 <h1> OpenTransformer </h1>
 <a>This is a testing loop transformer model that is designed to be massive and have deep thought, specificly for logical tasks. (Has no datset it is just a test architecture.)</a>
+<a>Claude Mythos is rumored to use the Looped Transformer.</a>
 <h2>They Looped Transformer</b></h2>
 <p>The looped transformer makes each block 30 layers, and the same weights are repeated 30 times to make a 900 layer model So the total # of parameters is 30 layers worth, but the effective depth is 600 layers. Also I will eventually add different modes for different number of blocks, such as a fast with uses 15 blocks, a normal with uses 30 blocks, and a thinking mode which uses 60 blocks</p>
 <p>This model has 491,471,078,400 parameters, which means because the same data is being updated, it can be more powerfull with less data, meaning that its power increases faster per unit of training time that other models of its size, thus meaning that the training time can be significantly reduced.</p>
