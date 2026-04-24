@@ -162,7 +162,7 @@ if __name__ == "__main__":
         exit()
     # Scaled down for testing so it doesn't crash your computer
     VOCAB_SIZE = 32000
-    D_MODEL = 512
+    D_MODEL = 8196
     
     model = FullLoopedMoELM(
         vocab_size=VOCAB_SIZE, 
