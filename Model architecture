@@ -1,22 +1,19 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
-n_e = 32
-layers = 60
-block_repeats = 60
-
-# So the effective depth in parameters 40,955,923,200*9.
+n_e = 256
+layers = 30
+block_repeats = 30 # So the effective depth in parameters 491,471,078,400. 
 
 class MoELayer(nn.Module):
-
     # This makes each block 30 layers, and the same weights are repeated 20 times to make a 600 layer model
     # With only 5% of the training time.
     # So the total # of parameters is 30 layers worth, but the effective depth is 600 layers.
     # Also I will eventually add different modes for different number of blocks
     # Such as a fast with uses 15 blocks, a normal with uses 30 blocks,
     # And a thinking mode which uses 60 blocks
-
     def __init__(self, d_model, num_experts=n_e, k=2):
         super().__init__()
         self.experts = nn.ModuleList([nn.Sequential(
@@ -26,23 +23,46 @@ class MoELayer(nn.Module):
         ) for _ in range(num_experts)])
         self.router = nn.Linear(d_model, num_experts)
         self.k = k
+        self.num_experts = num_experts
+        self.last_aux_loss = 0.0
 
     def forward(self, x):
         # Route tokens to top-k experts
+        b, s, d = x.shape
         logits = self.router(x)
-        weights, indices = torch.topk(torch.softmax(logits, dim=-1), self.k, dim=-1)
+        probs = F.softmax(logits, dim=-1)
+        weights, indices = torch.topk(probs, self.k, dim=-1)
         
-        # Combine expert outputs (simplified for brevity)
-        out = torch.zeros_like(x)
-        for i in range(self.k):
-            expert_idx = indices[..., i]
-            expert_weight = weights[..., i].unsqueeze(-1)
-            # In practice, use optimized routing/scatter-gather
-            for batch in range(x.size(0)):
-                for seq in range(x.size(1)):
-                    idx = expert_idx[batch, seq]
-                    out[batch, seq] += expert_weight[batch, seq] * self.experts[idx](x[batch, seq])
-        return out
+        # --- Load Balancing Loss (Auxiliary Loss) ---
+        # fi: fraction of tokens routed to each expert
+        # Pi: average probability assigned to each expert
+        if self.training:
+            # Calculate fraction of tokens assigned to each expert (actual load)
+            # We use top-1 for the 'load' part as per standard Switch Transformer implementations
+            top1_indices = indices[..., 0].flatten()
+            fi = torch.bincount(top1_indices, minlength=self.num_experts).float() / top1_indices.numel()
+            
+            # Calculate average routing probability (intended load)
+            Pi = probs.view(-1, self.num_experts).mean(dim=0)
+            
+            # Auxiliary Loss = num_experts * sum(fi * Pi)
+            # Perfect balance results in loss = 1.0
+            self.last_aux_loss = self.num_experts * torch.sum(fi * Pi)
+
+        # --- Vectorized Routing ---
+        x_flat = x.view(-1, d)
+        indices_flat = indices.view(-1, self.k)
+        weights_flat = weights.view(-1, self.k)
+        out_flat = torch.zeros_like(x_flat)
+
+        for i in range(self.num_experts):
+            mask = (indices_flat == i)
+            if mask.any():
+                token_indices, k_slots = torch.where(mask)
+                expert_out = self.experts[i](x_flat[token_indices])
+                out_flat[token_indices] += expert_out * weights_flat[token_indices, k_slots].unsqueeze(-1)
+        
+        return out_flat.view(b, s, d)
 
 # A single Transformer Layer with MoE
 class TransformerMoELayer(nn.Module):
@@ -67,7 +87,8 @@ class LoopTransformerMoE(nn.Module):
         super().__init__()
         # Define the block of 30 layers
         self.block = nn.ModuleList([
-            TransformerMoELayer(d_model, nhead) for _ in range(layers_per_block)
+            TransformerMoELayer(d_model, nhead)
+            for _ in range(layers_per_block)
         ])
         self.num_loops = num_loops
 
@@ -75,26 +96,26 @@ class LoopTransformerMoE(nn.Module):
         # Repeat the block 20 times
         for _ in range(self.num_loops):
             for layer in self.block:
-                x = layer(x)
+                # Use checkpointing to save memory during backprop
+                x = checkpoint(layer, x, use_reentrant=False)
         return x
+    
+    def get_total_aux_loss(self):
+        # Helper to sum up auxiliary losses from all MoE layers in the block
+        total_loss = 0
+        for layer in self.block:
+            total_loss += layer.moe.last_aux_loss
+        return total_loss
 
 def count_parameters(model):
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
-
 # Counts number of parameters in the model
 
-''' WARNING: MAY CRASH YOUR COMPUTER IF YOU TRY TO RUN IT, IT'S A VERY LARGE MODEL. ''' 
-
+''' WARNING: MAY CRASH YOUR COMPUTER IF YOU TRY TO RUN IT, IT'S A VERY LARGE MODEL. '''
 #model = LoopTransformerMoE(d_model=512, nhead=8)
 #total, trainable = count_parameters(model)
 #print(f"Total Parameters: {total:,}")
-
-
-
 # Example Initialization
 # model = LoopTransformerMoE(d_model=512, nhead=8, layers_per_block=20, num_loops=10)
-
-
-print(40955923200*9)
