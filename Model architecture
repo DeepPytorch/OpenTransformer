@@ -5,15 +5,9 @@ from torch.utils.checkpoint import checkpoint
 
 n_e = 256
 layers = 30
-block_repeats = 30 # So the effective depth in parameters 491,471,078,400. 
+block_repeats = 30 # Effective depth is layers * block_repeats
 
 class MoELayer(nn.Module):
-    # This makes each block 30 layers, and the same weights are repeated 20 times to make a 600 layer model
-    # With only 5% of the training time.
-    # So the total # of parameters is 30 layers worth, but the effective depth is 600 layers.
-    # Also I will eventually add different modes for different number of blocks
-    # Such as a fast with uses 15 blocks, a normal with uses 30 blocks,
-    # And a thinking mode which uses 60 blocks
     def __init__(self, d_model, num_experts=n_e, k=2):
         super().__init__()
         self.experts = nn.ModuleList([nn.Sequential(
@@ -21,32 +15,23 @@ class MoELayer(nn.Module):
             nn.GELU(),
             nn.Linear(d_model * 4, d_model)
         ) for _ in range(num_experts)])
+        
         self.router = nn.Linear(d_model, num_experts)
         self.k = k
         self.num_experts = num_experts
         self.last_aux_loss = 0.0
 
     def forward(self, x):
-        # Route tokens to top-k experts
         b, s, d = x.shape
         logits = self.router(x)
         probs = F.softmax(logits, dim=-1)
         weights, indices = torch.topk(probs, self.k, dim=-1)
         
         # --- Load Balancing Loss (Auxiliary Loss) ---
-        # fi: fraction of tokens routed to each expert
-        # Pi: average probability assigned to each expert
         if self.training:
-            # Calculate fraction of tokens assigned to each expert (actual load)
-            # We use top-1 for the 'load' part as per standard Switch Transformer implementations
             top1_indices = indices[..., 0].flatten()
             fi = torch.bincount(top1_indices, minlength=self.num_experts).float() / top1_indices.numel()
-            
-            # Calculate average routing probability (intended load)
             Pi = probs.view(-1, self.num_experts).mean(dim=0)
-            
-            # Auxiliary Loss = num_experts * sum(fi * Pi)
-            # Perfect balance results in loss = 1.0
             self.last_aux_loss = self.num_experts * torch.sum(fi * Pi)
 
         # --- Vectorized Routing ---
@@ -64,7 +49,7 @@ class MoELayer(nn.Module):
         
         return out_flat.view(b, s, d)
 
-# A single Transformer Layer with MoE
+
 class TransformerMoELayer(nn.Module):
     def __init__(self, d_model, nhead):
         super().__init__()
@@ -73,19 +58,26 @@ class TransformerMoELayer(nn.Module):
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
 
-    def forward(self, x):
+    def forward(self, x, is_causal=True):
+        # Generate causal mask for autoregressive language modeling
+        attn_mask = None
+        if is_causal:
+            seq_len = x.size(1)
+            # Creates a triangular mask to prevent looking ahead
+            attn_mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(x.device)
+
         # Attention + Residual
-        attn_out, _ = self.attn(x, x, x)
+        attn_out, _ = self.attn(x, x, x, attn_mask=attn_mask, is_causal=is_causal)
         x = self.norm1(x + attn_out)
+        
         # MoE + Residual
         x = self.norm2(x + self.moe(x))
         return x
 
-# The main Loop Transformer MoE Model
+
 class LoopTransformerMoE(nn.Module):
     def __init__(self, d_model, nhead, layers_per_block=layers, num_loops=block_repeats):
         super().__init__()
-        # Define the block of 30 layers
         self.block = nn.ModuleList([
             TransformerMoELayer(d_model, nhead)
             for _ in range(layers_per_block)
@@ -93,29 +85,102 @@ class LoopTransformerMoE(nn.Module):
         self.num_loops = num_loops
 
     def forward(self, x):
-        # Repeat the block 20 times
         for _ in range(self.num_loops):
             for layer in self.block:
-                # Use checkpointing to save memory during backprop
-                x = checkpoint(layer, x, use_reentrant=False)
+                # Use kwargs to pass the causal flag through gradient checkpointing
+                x = checkpoint(layer, x, use_reentrant=False, is_causal=True)
         return x
     
     def get_total_aux_loss(self):
-        # Helper to sum up auxiliary losses from all MoE layers in the block
         total_loss = 0
+        # Important: Multiply by num_loops since we pass through the block multiple times
         for layer in self.block:
             total_loss += layer.moe.last_aux_loss
-        return total_loss
+        return total_loss * self.num_loops
+
+
+# --- NEW: The Full Language Model Wrapper ---
+class FullLoopedMoELM(nn.Module):
+    def __init__(self, vocab_size, d_model=512, nhead=8, max_seq_len=2048):
+        super().__init__()
+        self.d_model = d_model
+        
+        # Token and Positional Embeddings
+        self.token_emb = nn.Embedding(vocab_size, d_model)
+        self.pos_emb = nn.Embedding(max_seq_len, d_model)
+        
+        self.backbone = LoopTransformerMoE(d_model, nhead)
+        
+        # Final LayerNorm and Language Modeling Head
+        self.ln_f = nn.LayerNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        
+        # Weight Tying 
+        self.token_emb.weight = self.lm_head.weight
+
+    def forward(self, idx, targets=None, aux_loss_weight=0.01):
+        b, t = idx.size()
+        
+        # Generate positional indices
+        pos = torch.arange(0, t, dtype=torch.long, device=idx.device)
+        
+        # Add token and positional embeddings
+        x = self.token_emb(idx) + self.pos_emb(pos)
+        
+        # Pass through the looping MoE backbone
+        x = self.backbone(x)
+        
+        # Final normalization and vocab projection
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        
+        loss = None
+        if targets is not None:
+            # Main Cross-Entropy Loss
+            ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            
+            # Retrieve MoE routing auxiliary loss
+            aux_loss = self.backbone.get_total_aux_loss()
+            
+            # Combine losses
+            loss = ce_loss + (aux_loss_weight * aux_loss)
+            
+        return logits, loss
 
 def count_parameters(model):
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
-# Counts number of parameters in the model
 
-''' WARNING: MAY CRASH YOUR COMPUTER IF YOU TRY TO RUN IT, IT'S A VERY LARGE MODEL. '''
-#model = LoopTransformerMoE(d_model=512, nhead=8)
-#total, trainable = count_parameters(model)
-#print(f"Total Parameters: {total:,}")
-# Example Initialization
-# model = LoopTransformerMoE(d_model=512, nhead=8, layers_per_block=20, num_loops=10)
+# --- Testing the Initialization ---
+if __name__ == "__main__":
+    print("WARNING: This model is designed to be extremely large. The following test is scaled down for demonstration purposes. " \
+    "BUT IT MOST LIKELY WILL CRASH YOUR PC, SO PROCEED WITH CAUTION! Adjust the parameters as needed.")
+    x = input("Type 'yes' to proceed with the test (or anything else to exit): ")
+    if x.lower() != 'yes':  
+        print("Exiting test.")
+        exit()
+    # Scaled down for testing so it doesn't crash your computer
+    VOCAB_SIZE = 32000
+    D_MODEL = 512
+    
+    model = FullLoopedMoELM(
+        vocab_size=VOCAB_SIZE, 
+        d_model=D_MODEL, 
+        nhead=8
+    )
+    
+    total, trainable = count_parameters(model)
+    print(f"Total Parameters (Storage): {total:,}")
+    
+    # Calculate Effective Parameters based on loops
+    effective_params = (total - model.token_emb.weight.numel()) * block_repeats 
+    print(f"Effective Parameters (Compute): ~{effective_params:,}")
+
+    # Dummy forward pass
+    dummy_input = torch.randint(0, VOCAB_SIZE, (2, 64)) # Batch size 2, Seq len 64
+    dummy_targets = torch.randint(0, VOCAB_SIZE, (2, 64))
+    
+    logits, loss = model(dummy_input, targets=dummy_targets)
+    print(f"Logits shape: {logits.shape}") # Should be [2, 64, 32000]
+    print(f"Combined Loss (CE + Aux): {loss.item():.4f}")
