@@ -3,184 +3,133 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-n_e = 256
-layers = 30
-block_repeats = 30 # Effective depth is layers * block_repeats
+# --- 1. CORE STABILITY & PERFORMANCE BLOCKS ---
 
-class MoELayer(nn.Module):
-    def __init__(self, d_model, num_experts=n_e, k=2):
+class RMSNorm(nn.Module):
+    def __init__(self, d_model, eps=1e-6):
         super().__init__()
-        self.experts = nn.ModuleList([nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
-            nn.GELU(),
-            nn.Linear(d_model * 4, d_model)
-        ) for _ in range(num_experts)])
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d_model))
+
+    def forward(self, x):
+        # RMSNorm is faster and more stable for ultra-deep models
+        norm_x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return self.weight * norm_x
+
+class SwiGLU(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.w1 = nn.Linear(d_model, d_ff)
+        self.w2 = nn.Linear(d_model, d_ff)
+        self.w3 = nn.Linear(d_ff, d_model)
+
+    def forward(self, x):
+        # SiLU(x1) * x2 -> The Llama 3 standard
+        return self.w3(F.silu(self.w1(x)) * self.w2(x))
+
+# --- 2. MULTI-HEAD LATENT ATTENTION (MLA) ---
+
+class LatentAttention(nn.Module):
+    def __init__(self, d_model, n_heads=32, latent_dim=512):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
         
-        self.router = nn.Linear(d_model, num_experts)
+        # KV Compression
+        self.kv_compress = nn.Linear(d_model, latent_dim)
+        self.kv_up = nn.Linear(latent_dim, d_model * 2) # Keys and Values
+        
+        # Query Projection
+        self.q_proj = nn.Linear(d_model, d_model)
+
+    def forward(self, x, mask=None):
+        b, s, d = x.shape
+        
+        q = self.q_proj(x).view(b, s, self.n_heads, self.d_head).transpose(1, 2)
+        
+        # Compress and then decompress KV
+        latent = self.kv_compress(x)
+        kv = self.kv_up(latent).view(b, s, 2, self.n_heads, self.d_head)
+        k, v = kv[:, :, 0], kv[:, :, 1]
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=True)
+        return out.transpose(1, 2).contiguous().view(b, s, d)
+
+# --- 3. MOE WITH SHARED EXPERTS ---
+
+class DeepMoE(nn.Module):
+    def __init__(self, d_model, n_routed=240, n_shared=16, k=2):
+        super().__init__()
         self.k = k
-        self.num_experts = num_experts
-        self.last_aux_loss = 0.0
+        # Routed Experts: High Specialization
+        self.routed_experts = nn.ModuleList([SwiGLU(d_model, d_model*2) for _ in range(n_routed)])
+        # Shared Experts: General Knowledge (Always Active)
+        self.shared_experts = nn.ModuleList([SwiGLU(d_model, d_model*2) for _ in range(n_shared)])
+        
+        self.router = nn.Linear(d_model, n_routed)
 
     def forward(self, x):
         b, s, d = x.shape
-        logits = self.router(x)
+        x_flat = x.view(-1, d)
+        
+        # 1. Compute Shared Experts (All tokens pass through these)
+        shared_out = sum(expert(x) for expert in self.shared_experts)
+        
+        # 2. Compute Routed Experts
+        logits = self.router(x_flat)
         probs = F.softmax(logits, dim=-1)
         weights, indices = torch.topk(probs, self.k, dim=-1)
         
-        # --- Load Balancing Loss (Auxiliary Loss) ---
-        if self.training:
-            top1_indices = indices[..., 0].flatten()
-            fi = torch.bincount(top1_indices, minlength=self.num_experts).float() / top1_indices.numel()
-            Pi = probs.view(-1, self.num_experts).mean(dim=0)
-            self.last_aux_loss = self.num_experts * torch.sum(fi * Pi)
-
-        # --- Vectorized Routing ---
-        x_flat = x.view(-1, d)
-        indices_flat = indices.view(-1, self.k)
-        weights_flat = weights.view(-1, self.k)
-        out_flat = torch.zeros_like(x_flat)
-
-        for i in range(self.num_experts):
-            mask = (indices_flat == i)
+        routed_out = torch.zeros_like(x_flat)
+        for i in range(len(self.routed_experts)):
+            mask = (indices == i)
             if mask.any():
-                token_indices, k_slots = torch.where(mask)
-                expert_out = self.experts[i](x_flat[token_indices])
-                out_flat[token_indices] += expert_out * weights_flat[token_indices, k_slots].unsqueeze(-1)
+                token_idx, _ = torch.where(mask)
+                routed_out[token_idx] += self.routed_experts[i](x_flat[token_idx])
         
-        return out_flat.view(b, s, d)
+        return shared_out + routed_out.view(b, s, d)
 
+# --- 4. THE FULL LOOPED TRANSFORMER ---
 
-class TransformerMoELayer(nn.Module):
-    def __init__(self, d_model, nhead):
+class FrontierBlock(nn.Module):
+    def __init__(self, d_model, n_heads):
         super().__init__()
-        self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
-        self.moe = MoELayer(d_model)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-
-    def forward(self, x, is_causal=True):
-        # Generate causal mask for autoregressive language modeling
-        attn_mask = None
-        if is_causal:
-            seq_len = x.size(1)
-            # Creates a triangular mask to prevent looking ahead
-            attn_mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(x.device)
-
-        # Attention + Residual
-        attn_out, _ = self.attn(x, x, x, attn_mask=attn_mask, is_causal=is_causal)
-        x = self.norm1(x + attn_out)
-        
-        # MoE + Residual
-        x = self.norm2(x + self.moe(x))
-        return x
-
-
-class LoopTransformerMoE(nn.Module):
-    def __init__(self, d_model, nhead, layers_per_block=layers, num_loops=block_repeats):
-        super().__init__()
-        self.block = nn.ModuleList([
-            TransformerMoELayer(d_model, nhead)
-            for _ in range(layers_per_block)
-        ])
-        self.num_loops = num_loops
+        self.attn = LatentAttention(d_model, n_heads)
+        self.moe = DeepMoE(d_model)
+        self.norm1 = RMSNorm(d_model)
+        self.norm2 = RMSNorm(d_model)
 
     def forward(self, x):
-        for _ in range(self.num_loops):
-            for layer in self.block:
-                # Use kwargs to pass the causal flag through gradient checkpointing
-                x = checkpoint(layer, x, use_reentrant=False, is_causal=True)
+        x = x + self.attn(self.norm1(x))
+        x = x + self.moe(self.norm2(x))
         return x
-    
-    def get_total_aux_loss(self):
-        total_loss = 0
-        # Important: Multiply by num_loops since we pass through the block multiple times
-        for layer in self.block:
-            total_loss += layer.moe.last_aux_loss
-        return total_loss * self.num_loops
 
-
-# --- NEW: The Full Language Model Wrapper ---
-class FullLoopedMoELM(nn.Module):
-    def __init__(self, vocab_size, d_model=512, nhead=8, max_seq_len=2048):
+class UltraLoopTransformer(nn.Module):
+    def __init__(self, vocab_size, d_model=8192, layers=30, loops=30):
         super().__init__()
-        self.d_model = d_model
-        
-        # Token and Positional Embeddings
         self.token_emb = nn.Embedding(vocab_size, d_model)
-        self.pos_emb = nn.Embedding(max_seq_len, d_model)
-        
-        self.backbone = LoopTransformerMoE(d_model, nhead)
-        
-        # Final LayerNorm and Language Modeling Head
-        self.ln_f = nn.LayerNorm(d_model)
-        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
-        
-        # Weight Tying 
-        self.token_emb.weight = self.lm_head.weight
+        self.block = nn.ModuleList([FrontierBlock(d_model, 64) for _ in range(layers)])
+        self.loops = loops
+        self.output = nn.Linear(d_model, vocab_size)
 
-    def forward(self, idx, targets=None, aux_loss_weight=0.01):
-        b, t = idx.size()
+    def forward(self, idx):
+        # Initial Embedding
+        x = self.token_emb(idx)
+        recall_tensor = x # Store original input for Recall Injection
         
-        # Generate positional indices
-        pos = torch.arange(0, t, dtype=torch.long, device=idx.device)
-        
-        # Add token and positional embeddings
-        x = self.token_emb(idx) + self.pos_emb(pos)
-        
-        # Pass through the looping MoE backbone
-        x = self.backbone(x)
-        
-        # Final normalization and vocab projection
-        x = self.ln_f(x)
-        logits = self.lm_head(x)
-        
-        loss = None
-        if targets is not None:
-            # Main Cross-Entropy Loss
-            ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        for loop_idx in range(self.loops):
+            # Recall Injection: Add original signal to prevent "forgetting"
+            # Scaled by loop depth to maintain stability
+            x = x + (recall_tensor * (1.0 / (loop_idx + 1)))
             
-            # Retrieve MoE routing auxiliary loss
-            aux_loss = self.backbone.get_total_aux_loss()
-            
-            # Combine losses
-            loss = ce_loss + (aux_loss_weight * aux_loss)
-            
-        return logits, loss
+            for layer in self.block:
+                # Gradient checkpointing is mandatory at this scale
+                x = checkpoint(layer, x, use_reentrant=False)
+                
+        return self.output(x)
 
-def count_parameters(model):
-    total = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    return total, trainable
-
-# --- Testing the Initialization ---
-if __name__ == "__main__":
-    print("WARNING: This model is designed to be extremely large. The following test is scaled down for demonstration purposes. " \
-    "BUT IT MOST LIKELY WILL CRASH YOUR PC, SO PROCEED WITH CAUTION! Adjust the parameters as needed.")
-    x = input("Type 'yes' to proceed with the test (or anything else to exit): ")
-    if x.lower() != 'yes':  
-        print("Exiting test.")
-        exit()
-    # Scaled down for testing so it doesn't crash your computer
-    VOCAB_SIZE = 32000
-    D_MODEL = 8196
-    
-    model = FullLoopedMoELM(
-        vocab_size=VOCAB_SIZE, 
-        d_model=D_MODEL, 
-        nhead=8
-    )
-    
-    total, trainable = count_parameters(model)
-    print(f"Total Parameters (Storage): {total:,}")
-    
-    # Calculate Effective Parameters based on loops
-    effective_params = (total - model.token_emb.weight.numel()) * block_repeats 
-    print(f"Effective Parameters (Compute): ~{effective_params:,}")
-
-    # Dummy forward pass
-    dummy_input = torch.randint(0, VOCAB_SIZE, (2, 64)) # Batch size 2, Seq len 64
-    dummy_targets = torch.randint(0, VOCAB_SIZE, (2, 64))
-    
-    logits, loss = model(dummy_input, targets=dummy_targets)
-    print(f"Logits shape: {logits.shape}") # Should be [2, 64, 32000]
-    print(f"Combined Loss (CE + Aux): {loss.item():.4f}")
+# --- CONFIGURATION ---
+model = UltraLoopTransformer(vocab_size=128000, d_model=8192)
+print("Frontier MoE Loop Model Initialized.")
